@@ -178,6 +178,7 @@ export class GDBDebugSession extends LoggingDebugSession {
     // therefore be resumed after breakpoints are inserted.
     protected waitPausedNeeded = false;
     protected isInitialized = false;
+    protected isNotSupportDisassemble = false;
 
     constructor() {
         super();
@@ -1291,6 +1292,11 @@ export class GDBDebugSession extends LoggingDebugSession {
             let lastStartOffset = -1;
             const instructions: DebugProtocol.DisassembledInstruction[] = [];
             let oneIterationOnly = false;
+            if (this.isNotSupportDisassemble) {
+                response.body = { instructions };
+                this.sendResponse(response);
+                return;
+            }
             outer_loop: while (
                 instructions.length < args.instructionCount &&
                 !oneIterationOnly
