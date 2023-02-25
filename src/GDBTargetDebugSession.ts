@@ -77,14 +77,42 @@ export interface TargetLaunchRequestArguments
 export class GDBTargetDebugSession extends GDBDebugSession {
     protected gdbserver?: ChildProcess;
 
+    protected async attachOrLaunchRequest(
+        response: DebugProtocol.Response,
+        request: 'launch' | 'attach',
+        args: TargetLaunchRequestArguments | TargetAttachRequestArguments
+    ) {
+        this.setupCommonLoggerAndHandlers(args);
+
+        if (request === 'launch') {
+            const launchArgs = args as TargetLaunchRequestArguments;
+            if (
+                launchArgs.target?.serverParameters === undefined &&
+                !launchArgs.program
+            ) {
+                this.sendErrorResponse(
+                    response,
+                    1,
+                    'The program must be specified in the launch request arguments'
+                );
+                return;
+            }
+            await this.startGDBServer(launchArgs);
+        }
+
+        await this.startGDBAndAttachToTarget(response, args);
+    }
+
     protected async launchRequest(
         response: DebugProtocol.LaunchResponse,
         args: TargetLaunchRequestArguments
     ): Promise<void> {
         try {
-            this.setupCommonLoggerAndHandlers(args);
-            await this.startGDBServer(args);
-            await this.startGDBAndAttachToTarget(response, args);
+            const [request, resolvedArgs] = this.applyRequestArguments(
+                'launch',
+                args
+            );
+            await this.attachOrLaunchRequest(response, request, resolvedArgs);
         } catch (err) {
             this.sendErrorResponse(
                 response,
@@ -99,8 +127,11 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         args: TargetAttachRequestArguments
     ): Promise<void> {
         try {
-            this.setupCommonLoggerAndHandlers(args);
-            await this.startGDBAndAttachToTarget(response, args);
+            const [request, resolvedArgs] = this.applyRequestArguments(
+                'attach',
+                args
+            );
+            await this.attachOrLaunchRequest(response, request, resolvedArgs);
         } catch (err) {
             this.sendErrorResponse(
                 response,

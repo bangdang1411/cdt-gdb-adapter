@@ -1,5 +1,5 @@
 /*********************************************************************
- * Copyright (c) 2018 Ericsson and others
+ * Copyright (c) 2018, 2023 Ericsson and others
  *
  * This program and the accompanying materials are made
  * available under the terms of the Eclipse Public License 2.0
@@ -10,6 +10,10 @@
 import * as cp from 'child_process';
 import { DebugClient } from '@vscode/debugadapter-testsupport';
 import { DebugProtocol } from '@vscode/debugprotocol';
+import * as path from 'path';
+import { defaultAdapter } from './utils';
+import * as os from 'os';
+import { expect } from 'chai';
 
 export type ReverseRequestHandler<
     A = any,
@@ -23,11 +27,86 @@ export interface ReverseRequestHandlers {
     >;
 }
 
+function getAdapterAndArgs(adapter?: string): string[] {
+    const chosenAdapter = adapter !== undefined ? adapter : defaultAdapter;
+    const adapterPath: string = path.join(
+        __dirname,
+        '../../dist',
+        chosenAdapter
+    );
+    if (process.env.INSPECT_DEBUG_ADAPTER) {
+        return ['--inspect-brk', adapterPath];
+    }
+    return [adapterPath];
+}
+
 /**
- * Extend the DebugClient to support Reverse Requests:
- * https://microsoft.github.io/debug-adapter-protocol/specification#Reverse_Requests_RunInTerminal
+ * Extend the standard DebugClient to support additional client features
  */
 export class CdtDebugClient extends DebugClient {
+    private _cdt_args: string[];
+    private _cdt_adapterProcess?: cp.ChildProcess;
+    constructor(adapter?: string, extraArgs?: string[]) {
+        // The unused are as such because we do override process launching
+        super('unused', 'unused', 'gdb');
+        this._cdt_args = getAdapterAndArgs(adapter);
+        if (extraArgs) {
+            this._cdt_args.push(...extraArgs);
+        }
+        // These timeouts should be smaller than what is in .mocharc.json and .mocharc-windows-ci.json
+        // to allow the individual timeouts to fail before the whole test timesout.
+        // This will mean error message on things such as waitForEvent will not
+        // be hidden by overall test failure
+        this.defaultTimeout = os.platform() === 'win32' ? 25000 / 2 : 5000 / 2;
+    }
+
+    /**
+     * Start a debug session allowing command line arguments to be supplied
+     */
+    public start(port?: number): Promise<void> {
+        if (typeof port === 'number') {
+            return super.start(port);
+        }
+
+        return new Promise<void>((resolve, reject) => {
+            this._cdt_adapterProcess = cp.spawn('node', this._cdt_args);
+            this._cdt_adapterProcess.on('error', (err) => {
+                console.log(err);
+                reject(err);
+            });
+
+            if (
+                this._cdt_adapterProcess.stdout === null ||
+                this._cdt_adapterProcess.stdin === null
+            ) {
+                reject('Missing stdout/stdin');
+                return;
+            }
+            this.connect(
+                this._cdt_adapterProcess.stdout,
+                this._cdt_adapterProcess.stdin
+            );
+            resolve();
+        });
+    }
+
+    public stop(): Promise<void> {
+        return super
+            .stop()
+            .then(() => {
+                this.killAdapter();
+            })
+            .catch(() => {
+                this.killAdapter();
+            });
+    }
+
+    private killAdapter() {
+        if (this._cdt_adapterProcess) {
+            this._cdt_adapterProcess.kill();
+            this._cdt_adapterProcess = undefined;
+        }
+    }
     /**
      * Reverse Request Handlers:
      */
@@ -158,11 +237,13 @@ export class CdtDebugClient extends DebugClient {
     }
 
     /*
-     * Returns a promise that will resolve if an output event with a specific category was received.
+     * Returns a promise that will resolve if an output event
+     * with a specific category and optional output message was received.
      * The promise will be rejected if a timeout occurs.
      */
     public async waitForOutputEvent(
         category: string,
+        output?: string,
         timeout: number = this.defaultTimeout
     ): Promise<DebugProtocol.OutputEvent> {
         const isOutputEvent = (
@@ -174,26 +255,30 @@ export class CdtDebugClient extends DebugClient {
             );
         };
 
-        const timer = setTimeout(() => {
-            throw new Error(
-                `no output event with category '${category}' received after ${timeout} ms`
-            );
-        }, timeout);
-
-        for (;;) {
-            const event = await new Promise((resolve) =>
-                this.once('output', (e) => resolve(e))
-            );
-
-            if (!isOutputEvent(event)) {
-                continue;
-            }
-
-            if (event.body.category === category) {
-                clearTimeout(timer);
-                return event;
-            }
-        }
+        return new Promise<DebugProtocol.OutputEvent>((resolve, reject) => {
+            const outputProcessor = (event: DebugProtocol.OutputEvent) => {
+                if (isOutputEvent(event) && event.body.category === category) {
+                    if (output === undefined || output === event.body.output) {
+                        clearTimeout(timer);
+                        this.off('output', outputProcessor);
+                        resolve(event);
+                    }
+                }
+            };
+            const timer = setTimeout(() => {
+                this.off('output', outputProcessor);
+                reject(
+                    new Error(
+                        `no output event with category '${category}' ${
+                            output === undefined
+                                ? ''
+                                : `and output message '${output}'`
+                        } received after ${timeout} ms`
+                    )
+                );
+            }, timeout);
+            this.on('output', outputProcessor);
+        });
     }
 
     /**
@@ -239,6 +324,52 @@ export class CdtDebugClient extends DebugClient {
         args: DebugProtocol.WriteMemoryArguments
     ): Promise<DebugProtocol.WriteMemoryResponse> {
         return this.send('writeMemory', args);
+    }
+
+    public attachHitBreakpoint(
+        attachArgs: any,
+        breakpoint: { line: number; path: string }
+    ): Promise<any> {
+        return Promise.all([
+            this.waitForEvent('initialized')
+                .then((_event) => {
+                    return this.setBreakpointsRequest({
+                        breakpoints: [{ line: breakpoint.line }],
+                        source: { path: breakpoint.path },
+                    });
+                })
+                .then((response) => {
+                    const bp = response.body.breakpoints[0];
+                    expect(bp.verified).to.be.true;
+                    expect(bp.line).to.equal(breakpoint.line);
+
+                    return Promise.all([
+                        this.configurationDoneRequest(),
+                        this.assertStoppedLocation('breakpoint', breakpoint),
+                    ]);
+                }),
+
+            this.initializeRequest().then((_response) => {
+                return this.attachRequest(attachArgs);
+            }),
+        ]);
+    }
+
+    /**
+     * Obtain the value of the expression in the context of the
+     * top frame, of the first returned thread.
+     * @param name name of the variable
+     */
+    public async evaluate(expression: string): Promise<string | undefined> {
+        const threads = await this.threadsRequest();
+        const stack = await this.stackTraceRequest({
+            threadId: threads.body.threads[0].id,
+        });
+        const evalResponse = await this.evaluateRequest({
+            expression,
+            frameId: stack.body.stackFrames[0].id,
+        });
+        return evalResponse.body.result;
     }
 }
 
